@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 ARES + Obchodní rejstřík – Webová aplikace (Streamlit)
-Každý uživatel pracuje se svými daty v session state.
 """
 
 import io
-import threading
-import time
-
 import streamlit as st
 
 from ares_client import fetch_all
 from exporter import export_to_excel
-from legal_forms import DROPDOWN_OPTIONS, DEFAULT_FORM, parse_dropdown_code
-from obce_db import OBCE, hledej
+from legal_forms import DROPDOWN_OPTIONS, parse_dropdown_code
+from obce_db import hledej
 
 # ---------------------------------------------------------------------------
 # Konfigurace stránky
@@ -23,20 +19,19 @@ st.set_page_config(
     page_title="ARES + OR Vyhledávač",
     page_icon="🔎",
     layout="wide",
-    initial_sidebar_state="collapsed",
 )
 
 # ---------------------------------------------------------------------------
-# Session state – každý uživatel má svá data
+# Session state
 # ---------------------------------------------------------------------------
 
 def init_state():
     defaults = {
         "results": [],
-        "searching": False,
         "search_done": False,
         "error": None,
         "export_bytes": None,
+        "export_ready": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -75,14 +70,13 @@ with col1:
     )
     forma_kod = parse_dropdown_code(forma_raw) if forma_raw else None
 
-    # Obec – autocomplete přes text_input + filtrování
+    # Obec
     obec_query = st.text_input(
         "Obec",
         placeholder="Začněte psát název obce…",
         help="Vyberte obec ze seznamu níže",
     )
 
-    # Filtruj obce dle textu
     kod_obce = None
     if obec_query.strip():
         matches = hledej(obec_query.strip())[:30]
@@ -110,39 +104,41 @@ with col2:
         max_value=30.0,
         value=2.0,
         step=0.5,
-        help="Pauza mezi dotazy na Obchodní rejstřík. Vyšší = bezpečnější, pomalejší.",
+        help="Pauza mezi dotazy na Obchodní rejstřík.",
     )
-    st.caption(f"Odhad: {or_delay}s × počet výsledků")
+    n_res = len(st.session_state.results)
+    if n_res:
+        est = n_res * (or_delay + 0.5) / 60
+        st.caption(f"Odhad exportu: ~{est:.0f} min")
 
     st.markdown("---")
     st.markdown("##### Nápověda")
     st.markdown("""
 - **Obec**: napište název a vyberte ze seznamu
-- **Textová adresa**: volný text – město, PSČ, ulice
-- **Prodleva OR**: 2s = bezpečné, 0.5s = rychlejší ale riskantnější
+- **Textová adresa**: město, PSČ nebo ulice
+- **Prodleva OR**: 2s = bezpečné
 - Prázdné pole = filtr se **nepoužije**
     """)
 
 # ---------------------------------------------------------------------------
-# Tlačítka Vyhledat / Exportovat
+# Tlačítka
 # ---------------------------------------------------------------------------
 
 st.divider()
-bcol1, bcol2, bcol3 = st.columns([1, 1, 3])
+bcol1, bcol2 = st.columns([1, 1])
 
 with bcol1:
     hledat = st.button(
         "🔍 Vyhledat v ARES",
         type="primary",
         use_container_width=True,
-        disabled=st.session_state.searching,
     )
 
 with bcol2:
     exportovat = st.button(
-        "💾 Exportovat do Excelu",
+        "💾 Exportovat do Excelu (+OR osoby)",
         use_container_width=True,
-        disabled=not st.session_state.results or st.session_state.searching,
+        disabled=len(st.session_state.results) == 0,
     )
 
 # ---------------------------------------------------------------------------
@@ -153,16 +149,15 @@ if hledat:
     if not any([forma_kod, kod_obce, textova_adr]):
         st.error("⚠️ Vyplňte alespoň jedno pole: Právní forma, Obec nebo Textová adresa.")
     else:
-        st.session_state.searching = True
-        st.session_state.search_done = False
         st.session_state.results = []
+        st.session_state.search_done = False
         st.session_state.error = None
         st.session_state.export_bytes = None
+        st.session_state.export_ready = False
 
         progress_bar = st.progress(0, text="Připojuji se na ARES…")
 
         try:
-            # Jednoduché synchronní volání – Streamlit nemá vlákna
             results = fetch_all(
                 pravni_forma=forma_kod,
                 kod_obce=kod_obce,
@@ -180,11 +175,9 @@ if hledat:
         except Exception as e:
             st.session_state.error = f"Chyba: {e}"
             progress_bar.empty()
-        finally:
-            st.session_state.searching = False
 
 # ---------------------------------------------------------------------------
-# Zobrazení výsledků
+# Výsledky
 # ---------------------------------------------------------------------------
 
 if st.session_state.error:
@@ -194,9 +187,7 @@ if st.session_state.results:
     results = st.session_state.results
     st.success(f"✅ Nalezeno **{len(results):,}** subjektů")
 
-    # Tabulka preview
     import pandas as pd
-
     rows = []
     for s in results:
         sidlo = s.get("sidlo", {}) or {}
@@ -214,7 +205,7 @@ if st.session_state.results:
         df,
         use_container_width=True,
         hide_index=True,
-        height=400,
+        height=min(400, 50 + len(rows) * 35),
         column_config={
             "IČO": st.column_config.TextColumn(width="small"),
             "PF": st.column_config.TextColumn("Práv. forma", width="small"),
@@ -232,36 +223,32 @@ if exportovat and st.session_state.results:
     n = len(st.session_state.results)
     est = n * (or_delay + 0.5) / 60
 
-    with st.spinner(
-        f"Exportuji {n:,} subjektů + OR osoby (odhad ~{est:.0f} min, prodleva {or_delay}s)…"
-    ):
-        buf = io.BytesIO()
+    exp_progress = st.progress(0, text="Připravuji export…")
 
-        # Progress placeholder
-        exp_progress = st.progress(0, text="Připravuji export…")
+    buf = io.BytesIO()
+    try:
+        export_to_excel(
+            st.session_state.results,
+            buf,
+            or_delay=or_delay,
+            progress_callback=lambda cur, tot, msg: exp_progress.progress(
+                min(cur / max(tot, 1), 1.0), text=msg
+            ),
+        )
+        buf.seek(0)
+        st.session_state.export_bytes = buf.getvalue()
+        st.session_state.export_ready = True
+        exp_progress.progress(1.0, text="✅ Export dokončen – klikni na tlačítko níže")
+    except Exception as e:
+        st.error(f"Chyba při exportu: {e}")
+        exp_progress.empty()
 
-        try:
-            export_to_excel(
-                st.session_state.results,
-                buf,
-                or_delay=or_delay,
-                progress_callback=lambda cur, tot, msg: exp_progress.progress(
-                    min(cur / max(tot, 1), 1.0), text=msg
-                ),
-            )
-            buf.seek(0)
-            st.session_state.export_bytes = buf.getvalue()
-            exp_progress.progress(1.0, text="Export dokončen!")
-        except Exception as e:
-            st.error(f"Chyba při exportu: {e}")
-            exp_progress.empty()
-
-if st.session_state.export_bytes:
+# Tlačítko ke stažení – zobrazí se po exportu a zůstane dokud jsou výsledky
+if st.session_state.export_ready and st.session_state.export_bytes:
     st.download_button(
         label="⬇️ Stáhnout Excel",
         data=st.session_state.export_bytes,
         file_name="ares_export.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        use_container_width=False,
     )
